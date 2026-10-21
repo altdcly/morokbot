@@ -17,7 +17,8 @@ from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
-    Message, BufferedInputFile, ReplyKeyboardMarkup, KeyboardButton,
+    Message, CallbackQuery, BufferedInputFile, ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton,
 )
 
 # ==================== НАСТРОЙКИ ====================
@@ -51,6 +52,19 @@ CLIENT_KB = ReplyKeyboardMarkup(
 
 class Ask(StatesGroup):
     waiting = State()
+
+
+class Reply(StatesGroup):
+    waiting = State()
+
+
+def reply_kb(user_id):
+    """Кнопка «Ответить» под сообщением, которое приходит админу."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="✉️ Ответить", callback_data=f"reply:{user_id}")
+        ]]
+    )
 
 
 WELCOME_TEXT = (
@@ -167,6 +181,48 @@ async def cmd_start(message: Message):
     )
 
 
+@dp.message(Command("cancel"), F.from_user.id == ADMIN_ID)
+async def cmd_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Отменено.")
+
+
+@dp.callback_query(F.data.startswith("reply:"), F.from_user.id == ADMIN_ID)
+async def reply_button(call: CallbackQuery, state: FSMContext):
+    user_id = int(call.data.split(":", 1)[1])
+    t = get_ticket_by_user(user_id)
+    who = f"{t['full_name']} (ID {user_id})" if t else f"ID {user_id}"
+    await state.set_state(Reply.waiting)
+    await state.update_data(target=user_id)
+    await call.answer()
+    await call.message.answer(
+        f"✍️ Напишите ответ для <b>{html.escape(who)}</b> — следующее ваше сообщение уйдёт ему.\n"
+        "Отмена: /cancel"
+    )
+
+
+@dp.message(Reply.waiting, F.from_user.id == ADMIN_ID)
+async def reply_send(message: Message, state: FSMContext):
+    if message.text and message.text.startswith("/"):
+        await message.answer("Сейчас вы пишете ответ клиенту. Отправьте текст ответа или /cancel для отмены.")
+        return
+    data = await state.get_data()
+    user_id = data.get("target")
+    try:
+        if message.text:
+            await bot.send_message(
+                user_id, f"💬 <b>Ответ организатора:</b>\n\n{html.escape(message.text)}"
+            )
+        else:
+            await bot.send_message(user_id, "💬 <b>Ответ организатора:</b>")
+            await message.copy_to(user_id)
+        await message.answer("✅ Ответ отправлен клиенту.")
+    except Exception as e:
+        logging.error(f"Не удалось отправить ответ: {e}")
+        await message.answer("❌ Не удалось отправить (возможно, клиент заблокировал бота).")
+    await state.clear()
+
+
 @dp.message(F.from_user.id == ADMIN_ID, F.reply_to_message)
 async def admin_reply(message: Message):
     """Админ отвечает (функция «Ответить») на вопрос или чек — ответ уходит клиенту."""
@@ -228,9 +284,13 @@ async def handle_receipt(message: Message):
             f"🔗 {link}"
         )
         if message.photo:
-            sent = await bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=admin_text)
+            sent = await bot.send_photo(
+                ADMIN_ID, message.photo[-1].file_id, caption=admin_text, reply_markup=reply_kb(user.id)
+            )
         else:
-            sent = await bot.send_document(ADMIN_ID, message.document.file_id, caption=admin_text)
+            sent = await bot.send_document(
+                ADMIN_ID, message.document.file_id, caption=admin_text, reply_markup=reply_kb(user.id)
+            )
         save_msg_map(sent.message_id, user.id)
     except Exception as e:
         logging.error(f"Не удалось отправить копию админу: {e}")
@@ -322,11 +382,10 @@ async def ask_receive(message: Message, state: FSMContext):
     text = (
         "❓ <b>Новый вопрос</b>\n"
         f"👤 {html.escape(user.full_name)} (ID: <code>{user.id}</code>, {html.escape(uname)})\n\n"
-        f"{html.escape(message.text)}\n\n"
-        "<i>Чтобы ответить — нажмите «Ответить» на это сообщение.</i>"
+        f"{html.escape(message.text)}"
     )
     try:
-        sent = await bot.send_message(ADMIN_ID, text)
+        sent = await bot.send_message(ADMIN_ID, text, reply_markup=reply_kb(user.id))
         save_msg_map(sent.message_id, user.id)
         await message.answer("✅ Вопрос отправлен! Ответ придёт сюда, в этот чат.")
     except Exception as e:
