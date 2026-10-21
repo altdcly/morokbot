@@ -5,12 +5,18 @@ import asyncio
 import secrets
 import sqlite3
 from datetime import datetime
+from io import BytesIO
+
+from openpyxl import Workbook
+from openpyxl.styles import Font
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command, CommandObject
-from aiogram.types import Message
+from aiogram.types import (
+    Message, BufferedInputFile, ReplyKeyboardMarkup, KeyboardButton,
+)
 
 # ==================== НАСТРОЙКИ ====================
 # Токен берём из переменной окружения BOT_TOKEN (в Amvera: раздел «Переменные»)
@@ -27,6 +33,12 @@ DB_PATH = os.getenv("DB_PATH", "/data/tickets.db")
 
 # Ссылка на канал перестаёт работать после этой даты
 LINK_EXPIRES = datetime(2026, 11, 1, 12, 0)
+
+EXPORT_BTN = "📥 Выгрузить Excel"
+STAFF_KB = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text=EXPORT_BTN)]],
+    resize_keyboard=True,
+)
 
 WELCOME_TEXT = (
     "Привет, {name}! 👋\n\n"
@@ -111,7 +123,11 @@ def ticket_message(code, link):
 # ---------- хендлеры клиента ----------
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    await message.answer(WELCOME_TEXT.format(name=html.escape(message.from_user.full_name)))
+    kb = STAFF_KB if message.from_user.id in STAFF_IDS else None
+    await message.answer(
+        WELCOME_TEXT.format(name=html.escape(message.from_user.full_name)),
+        reply_markup=kb,
+    )
 
 
 @dp.message(F.photo | F.document)
@@ -197,6 +213,40 @@ async def cmd_list(message: Message):
     text = "\n".join(lines)
     for i in range(0, len(text), 4000):
         await message.answer(text[i:i + 4000])
+
+
+@dp.message(Command("admin"), F.from_user.id.in_(STAFF_IDS))
+async def cmd_admin(message: Message):
+    await message.answer("Панель организатора 👇", reply_markup=STAFF_KB)
+
+
+@dp.message(F.text == EXPORT_BTN, F.from_user.id.in_(STAFF_IDS))
+async def export_excel(message: Message):
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM tickets ORDER BY created_at").fetchall()
+    if not rows:
+        await message.answer("Билетов пока нет — выгружать нечего.")
+        return
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Билеты"
+    ws.append(["ID и никнейм", "Билет"])
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    for r in rows:
+        nick = f"@{r['username']}" if r["username"] else "без ника"
+        ws.append([f"{r['user_id']} {nick}", r["code"]])
+    ws.column_dimensions["A"].width = 32
+    ws.column_dimensions["B"].width = 14
+
+    buf = BytesIO()
+    wb.save(buf)
+    filename = f"tickets_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.xlsx"
+    await message.answer_document(
+        BufferedInputFile(buf.getvalue(), filename=filename),
+        caption=f"Всего билетов: {len(rows)}",
+    )
 
 
 # ---------- всё остальное ----------
