@@ -14,7 +14,7 @@ from aiogram.types import Message
 
 # ==================== НАСТРОЙКИ ====================
 # Токен берём из переменной окружения BOT_TOKEN (в Amvera: раздел «Переменные»)
-BOT_TOKEN = "8715967531:AAGfxi5zOAPJ5Ch0NVZxB5RetUEQn5TvdUg"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = 641107229
 CHANNEL_ID = -1004394668922
 
