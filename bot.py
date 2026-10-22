@@ -43,6 +43,17 @@ STAFF_KB = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+# Кодовое слово «для друзей»: вместо чека присылаете его — бот даёт ссылку на 350 ₽
+FRIEND_CODEWORD = "кикимора"
+FRIEND_TEXT = (
+    "Кодовое слово принято! 🎉\n\n"
+    "🎟 Стоимость билета для вас: <b>350 ₽</b>\n\n"
+    "🔗 <b>Оплата по СБП:</b>\n"
+    "https://qr.nspk.ru/BS10004NU3RV59CV8AM9RCCI12BUU36U\n\n"
+    "После оплаты пришлите <b>скриншот чека</b> прямо в этот чат — "
+    "и я выдам вам билет и ссылку на канал."
+)
+
 ASK_BTN = "❓ Задать вопрос"
 CLIENT_KB = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text=ASK_BTN)]],
@@ -114,6 +125,15 @@ def init_db():
                 user_id INTEGER
             )"""
         )
+        # кто ввёл кодовое слово и ждёт билет «друг»
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS friend_pending (user_id INTEGER PRIMARY KEY)"
+        )
+        # для баз, созданных до обновления: добавляем колонку «категория»
+        try:
+            conn.execute("ALTER TABLE tickets ADD COLUMN category TEXT DEFAULT 'обычный'")
+        except sqlite3.OperationalError:
+            pass
 
 
 def get_ticket_by_user(user_id):
@@ -126,14 +146,34 @@ def get_ticket_by_code(code):
         return conn.execute("SELECT * FROM tickets WHERE code = ?", (code,)).fetchone()
 
 
-def save_ticket(code, user, link):
+def save_ticket(code, user, link, category="обычный"):
     with db() as conn:
         conn.execute(
-            "INSERT INTO tickets (code, user_id, username, full_name, invite_link, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tickets (code, user_id, username, full_name, invite_link, created_at, category) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (code, user.id, user.username, user.full_name, link,
-             datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S"), category),
         )
+
+
+def mark_friend(user_id):
+    with db() as conn:
+        conn.execute("INSERT OR IGNORE INTO friend_pending (user_id) VALUES (?)", (user_id,))
+
+
+def is_friend(user_id):
+    with db() as conn:
+        return conn.execute(
+            "SELECT 1 FROM friend_pending WHERE user_id = ?", (user_id,)
+        ).fetchone() is not None
+
+
+def friend_tag(t):
+    return "\n🏷 Пометка: <b>друг</b>" if t["category"] == "друг" else ""
+
+
+def is_codeword(m):
+    return bool(m.text) and m.text.strip().lower() == FRIEND_CODEWORD
 
 
 def save_msg_map(admin_msg_id, user_id):
@@ -258,6 +298,7 @@ async def handle_receipt(message: Message):
     await message.answer("🔄 Чек получен! Готовлю ваш билет...")
 
     try:
+        category = "друг" if is_friend(user.id) else "обычный"
         code = new_code()
         invite = await bot.create_chat_invite_link(
             chat_id=CHANNEL_ID,
@@ -266,7 +307,7 @@ async def handle_receipt(message: Message):
             name=f"Ticket {code}",
         )
         link = invite.invite_link
-        save_ticket(code, user, link)
+        save_ticket(code, user, link, category)
     except Exception as e:
         logging.error(f"Ошибка создания билета: {e}")
         await message.answer("❌ Произошла ошибка. Пожалуйста, свяжитесь с организатором.")
@@ -279,6 +320,7 @@ async def handle_receipt(message: Message):
         uname = f"@{user.username}" if user.username else "нет username"
         admin_text = (
             "💰 <b>Новый чек!</b>\n"
+            f"🏷 Категория: <b>{category}</b>\n"
             f"👤 {html.escape(user.full_name)} (ID: <code>{user.id}</code>, {html.escape(uname)})\n"
             f"🎟 Билет: <code>{code}</code>\n"
             f"🔗 {link}"
@@ -309,12 +351,12 @@ async def cmd_check(message: Message, command: CommandObject):
         return
     if t["used"]:
         await message.answer(
-            f"⚠️ Билет <code>{code}</code> УЖЕ ИСПОЛЬЗОВАН\n👤 {html.escape(t['full_name'])}"
+            f"⚠️ Билет <code>{code}</code> УЖЕ ИСПОЛЬЗОВАН\n👤 {html.escape(t['full_name'])}{friend_tag(t)}"
         )
         return
     with db() as conn:
         conn.execute("UPDATE tickets SET used = 1 WHERE code = ?", (code,))
-    await message.answer(f"✅ Билет <code>{code}</code> действителен — пропускаем!\n👤 {html.escape(t['full_name'])}")
+    await message.answer(f"✅ Билет <code>{code}</code> действителен — пропускаем!\n👤 {html.escape(t['full_name'])}{friend_tag(t)}")
 
 
 @dp.message(Command("list"), F.from_user.id.in_(STAFF_IDS))
@@ -328,7 +370,8 @@ async def cmd_list(message: Message):
     lines = [f"Всего билетов: {len(rows)}, прошли: {used}\n"]
     for r in rows:
         mark = "✅" if r["used"] else "▫️"
-        lines.append(f"{mark} <code>{r['code']}</code> — {html.escape(r['full_name'])}")
+        tag = " (друг)" if r["category"] == "друг" else ""
+        lines.append(f"{mark} <code>{r['code']}</code> — {html.escape(r['full_name'])}{tag}")
     text = "\n".join(lines)
     for i in range(0, len(text), 4000):
         await message.answer(text[i:i + 4000])
@@ -350,14 +393,15 @@ async def export_excel(message: Message):
     wb = Workbook()
     ws = wb.active
     ws.title = "Билеты"
-    ws.append(["ID и никнейм", "Билет"])
+    ws.append(["ID и никнейм", "Билет", "Пометка"])
     for cell in ws[1]:
         cell.font = Font(bold=True)
     for r in rows:
         nick = f"@{r['username']}" if r["username"] else "без ника"
-        ws.append([f"{r['user_id']} {nick}", r["code"]])
+        ws.append([f"{r['user_id']} {nick}", r["code"], "друг" if r["category"] == "друг" else ""])
     ws.column_dimensions["A"].width = 32
     ws.column_dimensions["B"].width = 14
+    ws.column_dimensions["C"].width = 12
 
     buf = BytesIO()
     wb.save(buf)
@@ -366,6 +410,17 @@ async def export_excel(message: Message):
         BufferedInputFile(buf.getvalue(), filename=filename),
         caption=f"Всего билетов: {len(rows)}",
     )
+
+
+# ---------- кодовое слово «друг» ----------
+@dp.message(is_codeword)
+async def friend_code(message: Message, state: FSMContext):
+    await state.clear()
+    if get_ticket_by_user(message.from_user.id):
+        await message.answer("У вас уже есть билет 🎟 Если нужна помощь — нажмите «❓ Задать вопрос».")
+        return
+    mark_friend(message.from_user.id)
+    await message.answer(FRIEND_TEXT)
 
 
 # ---------- вопросы от клиентов ----------
