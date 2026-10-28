@@ -55,10 +55,27 @@ FRIEND_TEXT = (
 )
 
 ASK_BTN = "❓ Задать вопрос"
+BUY_MORE_BTN = "🎟 Купить ещё один билет"
 CLIENT_KB = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text=ASK_BTN)]],
+    keyboard=[[KeyboardButton(text=BUY_MORE_BTN)], [KeyboardButton(text=ASK_BTN)]],
     resize_keyboard=True,
 )
+
+PAY_TEXT = (
+    "🎟 <b>Ещё один билет</b> — <b>750 ₽</b>\n\n"
+    "🔗 <b>Оплата по СБП:</b>\n"
+    "https://qr.nspk.ru/AS10003PQTEDCL9S9B5Q432RU29RFISJ\n\n"
+    "После оплаты пришлите <b>скриншот чека</b> прямо в этот чат 📎"
+)
+
+
+def more_kb():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Да", callback_data="more:yes"),
+            InlineKeyboardButton(text="❌ Нет", callback_data="more:no"),
+        ]]
+    )
 
 
 class Ask(StatesGroup):
@@ -86,9 +103,9 @@ WELCOME_TEXT = (
     "🎟 Стоимость билета: <b>750 ₽</b>\n\n"
     "🔗 <b>Оплата по СБП:</b>\n"
     "https://qr.nspk.ru/AS10003PQTEDCL9S9B5Q432RU29RFISJ\n\n"
-    "p.s. оплата может не открываться при включенном VPN\n"
     "После оплаты, пожалуйста, <b>пришлите скриншот чека прямо в этот чат</b> — "
-    "и я сразу выдам вам билет и ссылку на канал с дополнительной информацией.\n\n"
+    "и я сразу выдам вам билет и ссылку на канал с дополнительной информацией. "
+    "Если нужно несколько билетов, после оплаты я предложу купить ещё.\n\n"
     "Остались вопросы? Нажмите кнопку «❓ Задать вопрос» внизу."
 )
 # ===================================================
@@ -106,19 +123,21 @@ def db():
     return conn
 
 
+TICKETS_DDL = """CREATE TABLE tickets (
+    code TEXT PRIMARY KEY,
+    user_id INTEGER,
+    username TEXT,
+    full_name TEXT,
+    invite_link TEXT,
+    created_at TEXT,
+    used INTEGER DEFAULT 0,
+    category TEXT DEFAULT 'обычный'
+)"""
+
+
 def init_db():
     with db() as conn:
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS tickets (
-                code TEXT PRIMARY KEY,
-                user_id INTEGER UNIQUE,
-                username TEXT,
-                full_name TEXT,
-                invite_link TEXT,
-                created_at TEXT,
-                used INTEGER DEFAULT 0
-            )"""
-        )
+        conn.execute(TICKETS_DDL.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1))
         # какому клиенту принадлежит сообщение, пришедшее админу (для ответов)
         conn.execute(
             """CREATE TABLE IF NOT EXISTS msg_map (
@@ -130,11 +149,30 @@ def init_db():
         conn.execute(
             "CREATE TABLE IF NOT EXISTS friend_pending (user_id INTEGER PRIMARY KEY)"
         )
+        # кому показали ссылку на оплату и мы ждём чек
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS awaiting (user_id INTEGER PRIMARY KEY)"
+        )
         # для баз, созданных до обновления: добавляем колонку «категория»
         try:
             conn.execute("ALTER TABLE tickets ADD COLUMN category TEXT DEFAULT 'обычный'")
         except sqlite3.OperationalError:
             pass
+        # старые базы: user_id был UNIQUE — снимаем, чтобы у человека могло быть несколько билетов
+        has_unique = any(
+            r["unique"] and r["origin"] == "u"
+            for r in conn.execute("PRAGMA index_list(tickets)").fetchall()
+        )
+        if has_unique:
+            conn.execute("ALTER TABLE tickets RENAME TO tickets_old")
+            conn.execute(TICKETS_DDL)
+            conn.execute(
+                "INSERT INTO tickets (code, user_id, username, full_name, invite_link, "
+                "created_at, used, category) "
+                "SELECT code, user_id, username, full_name, invite_link, created_at, used, "
+                "COALESCE(category, 'обычный') FROM tickets_old"
+            )
+            conn.execute("DROP TABLE tickets_old")
 
 
 def get_ticket_by_user(user_id):
@@ -167,6 +205,43 @@ def is_friend(user_id):
         return conn.execute(
             "SELECT 1 FROM friend_pending WHERE user_id = ?", (user_id,)
         ).fetchone() is not None
+
+
+def count_user_tickets(user_id):
+    with db() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) AS c FROM tickets WHERE user_id = ?", (user_id,)
+        ).fetchone()["c"]
+
+
+def user_codes(user_id):
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT code FROM tickets WHERE user_id = ? ORDER BY created_at", (user_id,)
+        ).fetchall()
+    return [r["code"] for r in rows]
+
+
+def mark_awaiting(user_id):
+    with db() as conn:
+        conn.execute("INSERT OR IGNORE INTO awaiting (user_id) VALUES (?)", (user_id,))
+
+
+def is_awaiting(user_id):
+    with db() as conn:
+        return conn.execute(
+            "SELECT 1 FROM awaiting WHERE user_id = ?", (user_id,)
+        ).fetchone() is not None
+
+
+def clear_awaiting(user_id):
+    with db() as conn:
+        conn.execute("DELETE FROM awaiting WHERE user_id = ?", (user_id,))
+
+
+def clear_friend(user_id):
+    with db() as conn:
+        conn.execute("DELETE FROM friend_pending WHERE user_id = ?", (user_id,))
 
 
 def friend_tag(t):
@@ -202,9 +277,10 @@ def new_code():
             return code
 
 
-def ticket_message(code, link):
+def ticket_message(code, number, link):
+    num = f" №{number}" if number > 1 else ""
     return (
-        "✅ <b>Ваш билет готов!</b>\n\n"
+        f"✅ <b>Билет{num} оформлен!</b>\n\n"
         f"🎟 <b>Код билета:</b> <code>{code}</code>\n"
         f"🔗 <b>Канал с информацией:</b> {link}\n\n"
         "<i>Ссылка одноразовая — перейдите по ней сами и не передавайте другим. "
@@ -216,6 +292,7 @@ def ticket_message(code, link):
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     kb = STAFF_KB if message.from_user.id in STAFF_IDS else CLIENT_KB
+    mark_awaiting(message.from_user.id)
     await message.answer(
         WELCOME_TEXT.format(name=html.escape(message.from_user.full_name)),
         reply_markup=kb,
@@ -289,11 +366,12 @@ async def admin_reply(message: Message):
 async def handle_receipt(message: Message):
     user = message.from_user
 
-    # Если билет уже выдавали — повторяем тот же, а не создаём новый
-    existing = get_ticket_by_user(user.id)
-    if existing:
-        await message.answer("Ваш билет уже выдан 👇")
-        await message.answer(ticket_message(existing["code"], existing["invite_link"]))
+    # Если билеты у человека уже есть, а новую оплату он не начинал — просим нажать кнопку
+    if not is_awaiting(user.id) and count_user_tickets(user.id) > 0:
+        await message.answer(
+            "Чтобы купить ещё один билет, нажмите «🎟 Купить ещё один билет» внизу 👇",
+            reply_markup=CLIENT_KB,
+        )
         return
 
     await message.answer("🔄 Чек получен! Готовлю ваш билет...")
@@ -309,12 +387,19 @@ async def handle_receipt(message: Message):
         )
         link = invite.invite_link
         save_ticket(code, user, link, category)
+        clear_awaiting(user.id)
+        clear_friend(user.id)
+        number = count_user_tickets(user.id)
     except Exception as e:
         logging.error(f"Ошибка создания билета: {e}")
         await message.answer("❌ Произошла ошибка. Пожалуйста, свяжитесь с организатором.")
         return
 
-    await message.answer(ticket_message(code, link))
+    await message.answer(ticket_message(code, number, link), reply_markup=CLIENT_KB)
+    await message.answer(
+        "Хотите купить ещё один билет?",
+        reply_markup=more_kb(),
+    )
 
     # Копия организатору (ошибка здесь не должна ломать выдачу билета клиенту)
     try:
@@ -323,7 +408,7 @@ async def handle_receipt(message: Message):
             "💰 <b>Новый чек!</b>\n"
             f"🏷 Категория: <b>{category}</b>\n"
             f"👤 {html.escape(user.full_name)} (ID: <code>{user.id}</code>, {html.escape(uname)})\n"
-            f"🎟 Билет: <code>{code}</code>\n"
+            f"🎟 Билет: <code>{code}</code> (№{number} у этого клиента)\n"
             f"🔗 {link}"
         )
         if message.photo:
@@ -337,6 +422,37 @@ async def handle_receipt(message: Message):
         save_msg_map(sent.message_id, user.id)
     except Exception as e:
         logging.error(f"Не удалось отправить копию админу: {e}")
+
+
+@dp.callback_query(F.data == "more:yes")
+async def more_yes(call: CallbackQuery):
+    await call.answer()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    mark_awaiting(call.from_user.id)
+    await call.message.answer(PAY_TEXT)
+
+
+@dp.callback_query(F.data == "more:no")
+async def more_no(call: CallbackQuery):
+    await call.answer()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    codes = user_codes(call.from_user.id)
+    if not codes:
+        await call.message.answer("У вас пока нет билетов. Оплатите по ссылке и пришлите чек 📎")
+        return
+    codes_text = ", ".join(f"<code>{c}</code>" for c in codes)
+    await call.message.answer(
+        "Спасибо! 🎉 Ждём вас на «Морок и бал».\n\n"
+        f"🎟 Ваши билеты: {codes_text}\n\n"
+        "<i>Назовите коды на входе. Ссылки на канал вы получили вместе с билетами.</i>",
+        reply_markup=CLIENT_KB,
+    )
 
 
 # ---------- команды для организаторов ----------
@@ -417,11 +533,17 @@ async def export_excel(message: Message):
 @dp.message(is_codeword)
 async def friend_code(message: Message, state: FSMContext):
     await state.clear()
-    if get_ticket_by_user(message.from_user.id):
-        await message.answer("У вас уже есть билет 🎟 Если нужна помощь — нажмите «❓ Задать вопрос».")
-        return
     mark_friend(message.from_user.id)
+    mark_awaiting(message.from_user.id)
     await message.answer(FRIEND_TEXT)
+
+
+# ---------- кнопка «Купить ещё один билет» ----------
+@dp.message(F.text == BUY_MORE_BTN)
+async def buy_more(message: Message, state: FSMContext):
+    await state.clear()
+    mark_awaiting(message.from_user.id)
+    await message.answer(PAY_TEXT)
 
 
 # ---------- вопросы от клиентов ----------
@@ -455,6 +577,7 @@ async def ask_receive(message: Message, state: FSMContext):
 async def fallback(message: Message):
     await message.answer(
         "Чтобы получить билет, оплатите по ссылке из /start и пришлите сюда скриншот чека 📎\n"
+        "Нужен ещё один билет? Нажмите «🎟 Купить ещё один билет».\n"
         "Есть вопрос? Нажмите «❓ Задать вопрос»."
     )
 
